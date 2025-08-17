@@ -1,0 +1,372 @@
+
+requirements.txt
+aiogram==3.10.0
+SQLAlchemy==2.0.32
+asyncpg==0.29.0
+alembic==1.13.2
+python-dotenv==1.0.1
+pydantic-settings==2.4.0
+aiofiles==24.1.0
+flask==3.0.0
+
+ runtime.txt
+python-3.12.4
+
+ Procfile
+web: python app.py
+
+settings.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+BOT_TOKEN: str
+ADMINS: str = ""
+DATABASE_URL: str = "sqlite+aiosqlite:///./squirrel.db"
+MAIN_CHANNEL_ID: str = ""
+DAILY_REWARD: int = 100
+REFERRAL_REWARD: int = 200
+TASK_JOIN_REWARD: int = 100
+TIMEZONE: str = "UTC"
+class Config:
+    env_file = ".env"
+    case_sensitive = True
+settings = Settings()
+
+models.py
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column
+from sqlalchemy import Integer, BigInteger, String, ForeignKey, DateTime, Boolean, UniqueConstraint
+from datetime import datetime, timezone
+
+Base = declarative_base()
+
+def utcnow():
+return datetime.now(timezone.utc)
+
+class User(Base):
+tablename = "users"
+id: Mapped[int] = mapped_column(Integer, primary_key=True)
+tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+coins: Mapped[int] = mapped_column(Integer, default=0)
+referred_by: Mapped[int | None] = mapped_column(ForeignKey("users.tg_id"), nullable=True)
+joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+last_daily: Mapped[datetime | None]
+
+class Task(Base):
+tablename = "tasks"
+id: Mapped[int] = mapped_column(Integer, primary_key=True)
+type: Mapped[str] = mapped_column(String)
+title: Mapped[str] = mapped_column(String)
+data: Mapped[str] = mapped_column(String)
+reward: Mapped[int] = mapped_column(Integer, default=100)
+active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class TaskCompletion(Base):
+tablename = "task_completions"
+id: Mapped[int] = mapped_column(Integer, primary_key=True)
+user_tg_id: Mapped[int] = mapped_column(BigInteger, index=True)
+task_id: Mapped[int] = mapped_column(Integer, ForeignKey("tasks.id"))
+completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+table_args = (UniqueConstraint('user_tg_id', 'task_id', 'completed_at', name='uq_user_task_day'),)
+
+ database.py
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy import select, delete
+from datetime import datetime, timezone
+from settings import settings
+from models import Base, User, Task, TaskCompletion
+
+engine = create_async_engine(settings.DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+async def init_db():
+async with engine.begin() as conn:
+await conn.run_sync(Base.metadata.create_all)
+
+async def get_or_create_user(tg_id: int, referred_by: int | None = None):
+async with SessionLocal() as session:
+res = await session.execute(select(User).where(User.tg_id == tg_id))
+user = res.scalar_one_or_none()
+if user:
+return user, False
+user = User(tg_id=tg_id, referred_by=referred_by)
+session.add(user)
+await session.commit()
+return user, True
+
+async def add_coins(tg_id: int, amount: int):
+async with SessionLocal() as session:
+res = await session.execute(select(User).where(User.tg_id == tg_id))
+user = res.scalar_one()
+user.coins += amount
+await session.commit()
+return user.coins
+
+async def set_coins(tg_id: int, amount: int):
+async with SessionLocal() as session:
+res = await session.execute(select(User).where(User.tg_id == tg_id))
+user = res.scalar_one()
+user.coins = amount
+await session.commit()
+return user.coins
+
+async def get_balance(tg_id: int) -> int:
+async with SessionLocal() as session:
+res = await session.execute(select(User.coins).where(User.tg_id == tg_id))
+return res.scalar_one_or_none() or 0
+
+async def can_claim_daily(tg_id: int) -> bool:
+async with SessionLocal() as session:
+res = await session.execute(select(User).where(User.tg_id == tg_id))
+user = res.scalar_one()
+if user.last_daily is None:
+return True
+return (datetime.now(timezone.utc) - user.last_daily).total_seconds() >= 24*3600
+
+async def claim_daily(tg_id: int, reward: int) -> int:
+async with SessionLocal() as session:
+res = await session.execute(select(User).where(User.tg_id == tg_id))
+user = res.scalar_one()
+user.coins += reward
+user.last_daily = datetime.now(timezone.utc)
+await session.commit()
+return user.coins
+
+async def list_active_tasks():
+async with SessionLocal() as session:
+res = await session.execute(select(Task).where(Task.active == True))
+return res.scalars().all()
+
+async def add_task(task_type: str, title: str, data: str, reward: int):
+async with SessionLocal() as session:
+t = Task(type=task_type, title=title, data=data, reward=reward, active=True)
+session.add(t)
+await session.commit()
+return t.id
+
+async def remove_task(task_id: int):
+async with SessionLocal() as session:
+await session.execute(delete(Task).where(Task.id == task_id))
+await session.commit()
+
+async def mark_task_complete(user_tg_id: int, task_id: int):
+async with SessionLocal() as session:
+tc = TaskCompletion(user_tg_id=user_tg_id, task_id=task_id)
+session.add(tc)
+res = await session.execute(select(Task.reward).where(Task.id == task_id))
+reward = res.scalar_one()
+resu = await session.execute(select(User).where(User.tg_id == user_tg_id))
+user = resu.scalar_one()
+user.coins += reward
+await session.commit()
+
+async def completed_today(user_tg_id: int, task_id: int) -> bool:
+async with SessionLocal() as session:
+now = datetime.now(timezone.utc)
+start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+res = await session.execute(
+select(TaskCompletion).where(
+TaskCompletion.user_tg_id == user_tg_id,
+TaskCompletion.task_id == task_id,
+TaskCompletion.completed_at >= start
+)
+)
+return res.scalar_one_or_none() is not None
+
+services.py
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import ChatMemberAdministrator, ChatMemberOwner, ChatMemberMember
+
+async def is_member(bot: Bot, channel: str | int, user_id: int) -> bool:
+try:
+member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+return isinstance(member, (ChatMemberMember, ChatMemberAdministrator, ChatMemberOwner))
+except TelegramBadRequest:
+return False
+
+def make_ref_link(bot_username: str, user_id: int) -> str:
+return f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+app.py
+import asyncio, os
+from flask import Flask
+from threading import Thread
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from settings import settings
+from database import (
+init_db, get_or_create_user, add_coins, set_coins, get_balance,
+can_claim_daily, claim_daily, list_active_tasks, add_task, remove_task,
+mark_task_complete, completed_today
+)
+from services import is_member, make_ref_link
+
+tiny HTTP server for Render Web Service
+flask_app = Flask(name)
+@flask_app.get("/")
+def ok(): return "Squirrel Coins Bot is running!"
+def _run_http():
+port = int(os.environ.get("PORT", 10000))
+flask_app.run(host="0.0.0.0", port=port)
+def start_http():
+Thread(target=_run_http, daemon=True).start()
+
+BOT = Bot(settings.BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher()
+
+def is_admin(user_id: int) -> bool:
+if not settings.ADMINS: return False
+return str(user_id) in {x.strip() for x in settings.ADMINS.split(",") if x.strip()}
+
+def rainbow_title() -> str:
+return "🌈🧡💛💚💙💜 Squirrel Coins 💜💙💚💛🧡🌈"
+
+@dp.message(CommandStart())
+async def start(message: Message):
+referrer = None
+args = message.text.split()
+if len(args) > 1 and args.startswith("ref_"):Screenshot_20250817_192933.jpg
+try: referrer = int(args[4:])Screenshot_20250817_192933.jpg
+except: referrer = None
+user, is_new = await get_or_create_user(message.from_user.id, referred_by=referrer)
+if is_new and referrer and referrer != message.from_user.id:
+await add_coins(referrer, settings.REFERRAL_REWARD)
+kb = InlineKeyboardMarkup(inline_keyboard=[
+[InlineKeyboardButton(text="🎁 Daily", callback_data="daily")],
+[InlineKeyboardButton(text="📝 Tasks", callback_data="tasks")],
+[InlineKeyboardButton(text="👥 Invite", callback_data="invite")],
+[InlineKeyboardButton(text="💰 Balance", callback_data="balance")]
+])
+await message.answer(f"{rainbow_title()}\n\nWelcome to the Rainbow Squirrel world!", reply_markup=kb)
+
+@dp.callback_query(F.data == "balance")
+async def cb_balance(cb: CallbackQuery):
+bal = await get_balance(cb.from_user.id)
+await cb.message.edit_text(f"💰 Your Squirrel Coins: <b>{bal}</b>")
+await cb.answer()
+
+@dp.message(Command("balance"))
+async def cmd_balance(message: Message):
+bal = await get_balance(message.from_user.id)
+await message.reply(f"💰 Your Squirrel Coins: <b>{bal}</b>")
+
+@dp.callback_query(F.data == "invite")
+async def cb_invite(cb: CallbackQuery):
+link = make_ref_link((await BOT.get_me()).username, cb.from_user.id)
+await cb.message.edit_text(f"Invite friends:\n{link}\nReward: {settings.REFERRAL_REWARD}")
+await cb.answer()
+
+@dp.message(Command("invite"))
+async def cmd_invite(message: Message):
+link = make_ref_link((await BOT.get_me()).username, message.from_user.id)
+await message.reply(f"Your invite link:\n{link}")
+
+@dp.callback_query(F.data == "daily")
+async def cb_daily(cb: CallbackQuery):
+if await can_claim_daily(cb.from_user.id):
+bal = await claim_daily(cb.from_user.id, settings.DAILY_REWARD)
+await cb.message.edit_text(f"🎁 Daily +{settings.DAILY_REWARD}. Balance: <b>{bal}</b>")
+else:
+await cb.message.edit_text("⏳ Daily already claimed. Try again after 24h.")
+await cb.answer()
+
+@dp.message(Command("daily"))
+async def cmd_daily(message: Message):
+if await can_claim_daily(message.from_user.id):
+bal = await claim_daily(message.from_user.id, settings.DAILY_REWARD)
+await message.reply(f"🎁 Daily +{settings.DAILY_REWARD}. Balance: <b>{bal}</b>")
+else:
+await message.reply("⏳ Daily already claimed. Try again after 24h.")
+
+@dp.callback_query(F.data == "tasks")
+async def cb_tasks(cb: CallbackQuery):
+tasks = await list_active_tasks()
+if not tasks:
+await cb.message.edit_text("No tasks yet.")
+return await cb.answer()
+kb = InlineKeyboardBuilder()
+for t in tasks: kb.button(text=f"{t.title} (+{t.reward})", callback_data=f"task:{t.id}")
+kb.adjust(1)
+await cb.message.edit_text("📝 Daily Tasks:", reply_markup=kb.as_markup()); await cb.answer()
+
+@dp.callback_query(F.data.startswith("task:"))
+async def cb_task_detail(cb: CallbackQuery):
+task_id = int(cb.data.split(":"))Screenshot_20250817_192933.jpg
+tasks = await list_active_tasks()
+task = next((t for t in tasks if t.id == task_id), None)
+if not task: return await cb.answer("Task not found", show_alert=True)
+if await completed_today(cb.from_user.id, task_id):
+return await cb.answer("Already done today", show_alert=True)
+if task.type == "join_channel":
+joined = await is_member(BOT, task.data, cb.from_user.id)
+if not joined:
+kb = InlineKeyboardMarkup(inline_keyboard=[
+[InlineKeyboardButton(text="Open channel", url=f"https://t.me/{task.data.lstrip('@')}")],
+[InlineKeyboardButton(text="Check ✅",
+callback_data=f"verify:{task_id}")]
+])
+await cb.message.edit_text(f"Join {task.data} then press Check.", reply_markup=kb)
+else:
+await mark_task_complete(cb.from_user.id, task_id)
+await cb.message.edit_text(f"✅ Verified! +{task.reward} coins.")
+else:
+await cb.message.edit_text("Unknown task type.")
+await cb.answer()
+
+@dp.callback_query(F.data.startswith("verify:"))
+async def cb_verify(cb: CallbackQuery):
+task_id = int(cb.data.split(":"))Screenshot_20250817_192933.jpg
+tasks = await list_active_tasks()
+task = next((t for t in tasks if t.id == task_id), None)
+if not task: return await cb.answer("Task not found", show_alert=True)
+if await completed_today(cb.from_user.id, task_id):
+return await cb.answer("Already done today", show_alert=True)
+joined = await is_member(BOT, task.data, cb.from_user.id)
+if joined:
+await mark_task_complete(cb.from_user.id, task_id)
+await cb.message.edit_text(f"✅ Verified! +{task.reward} coins.")
+else:
+await cb.answer("Not joined yet.", show_alert=True)
+
+from aiogram.filters import Command
+@dp.message(Command("addtask"))
+async def admin_addtask(message: Message):
+if not is_admin(message.from_user.id): return await message.reply("Admins only.")
+try:
+_, ttype, data, reward, *title = message.text.split()
+reward = int(reward); title = " ".join(title) or f"Join {data}"
+task_id = await add_task(ttype, title, data, reward)
+await message.reply(f"Added task #{task_id}: {title}")
+except: await message.reply("Usage: /addtask join_channel @channel 100 Title")
+
+@dp.message(Command("removetask"))
+async def admin_removetask(message: Message):
+if not is_admin(message.from_user.id): return await message.reply("Admins only.")
+try:
+_, task_id = message.text.split()
+await remove_task(int(task_id)); await message.reply("Removed.")
+except: await message.reply("Usage: /removetask <task_id>")
+
+@dp.message(Command("setcoins"))
+async def admin_setcoins(message: Message):
+if not is_admin(message.from_user.id): return await message.reply("Admins only.")
+try:
+_, tg_id, amount = message.text.split()
+newb = await set_coins(int(tg_id), int(amount))
+await message.reply(f"Set coins for {tg_id} to {newb}.")
+except: await message.reply("Usage: /setcoins <tg_id> <amount>")
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+await message.reply("Use /daily, /tasks, /invite. Admin: /addtask, /removetask, /setcoins")
+
+async def main():
+start_http()
+await init_db()
+await dp.start_polling(BOT)
+
+if name == "main":
+asyncio.run(main())
