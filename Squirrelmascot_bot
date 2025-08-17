@@ -227,9 +227,11 @@ return "🌈🧡💛💚💙💜 Squirrel Coins 💜💙💚💛🧡🌈"
 async def start(message: Message):
 referrer = None
 args = message.text.split()
-if len(args) > 1 and args.startswith("ref_"):Screenshot_20250817_192933.jpg
-try: referrer = int(args[4:])Screenshot_20250817_192933.jpg
-except: referrer = None
+if len(args) > 1 and args[1].startswith("ref_"):
+    try:
+        referrer = int(args[1][4:])
+    except:
+        referrer = None
 user, is_new = await get_or_create_user(message.from_user.id, referred_by=referrer)
 if is_new and referrer and referrer != message.from_user.id:
 await add_coins(referrer, settings.REFERRAL_REWARD)
@@ -293,7 +295,7 @@ await cb.message.edit_text("📝 Daily Tasks:", reply_markup=kb.as_markup()); aw
 
 @dp.callback_query(F.data.startswith("task:"))
 async def cb_task_detail(cb: CallbackQuery):
-task_id = int(cb.data.split(":"))Screenshot_20250817_192933.jpg
+task_id = int(cb.data.split(":")[1])
 tasks = await list_active_tasks()
 task = next((t for t in tasks if t.id == task_id), None)
 if not task: return await cb.answer("Task not found", show_alert=True)
