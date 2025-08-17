@@ -48,8 +48,7 @@ tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
 coins: Mapped[int] = mapped_column(Integer, default=0)
 referred_by: Mapped[int | None] = mapped_column(ForeignKey("users.tg_id"), nullable=True)
 joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-last_daily: Mapped[datetime | None]
-
+last_daily: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 class Task(Base):
 tablename = "tasks"
 id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -204,7 +203,7 @@ mark_task_complete, completed_today
 from services import is_member, make_ref_link
 
 tiny HTTP server for Render Web Service
-flask_app = Flask(name)
+flask_app = Flask(_name_)
 @flask_app.get("/")
 def ok(): return "Squirrel Coins Bot is running!"
 def _run_http():
@@ -226,7 +225,7 @@ return "🌈🧡💛💚💙💜 Squirrel Coins 💜💙💚💛🧡🌈"
 @dp.message(CommandStart())
 async def start(message: Message):
 referrer = None
-args = message.text.split()
+args = message.text.split(maxsplit=1)
 if len(args) > 1 and args[1].startswith("ref_"):
     try:
         referrer = int(args[1][4:])
@@ -369,5 +368,5 @@ start_http()
 await init_db()
 await dp.start_polling(BOT)
 
-if name == "main":
+if _name_ == "_main_":
 asyncio.run(main())
